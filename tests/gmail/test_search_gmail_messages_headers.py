@@ -4,7 +4,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from gmail.gmail_tools import search_gmail_messages
+from gmail.gmail_helpers import GMAIL_METADATA_HEADERS
+from gmail.gmail_tools import (
+    GMAIL_SEARCH_HEADER_BATCH_SIZE,
+    search_gmail_messages,
+)
 
 
 def _unwrap(tool):
@@ -37,6 +41,10 @@ class _FakeBatch:
         self._callback = callback
         self._requests = []
 
+    @property
+    def request_ids(self):
+        return [request_id for request_id, _ in self._requests]
+
     def add(self, request, request_id):
         self._requests.append((request_id, request))
 
@@ -53,6 +61,7 @@ def _build_service(*, list_response, message_responses=None, batch_factory=None)
     message_responses = message_responses or {}
 
     service = Mock()
+    batches = []
 
     def message_list(**kwargs):
         request = Mock()
@@ -68,12 +77,25 @@ def _build_service(*, list_response, message_responses=None, batch_factory=None)
             request.execute.return_value = response
         return request
 
+    def recording_batch_factory(callback):
+        batch = _FakeBatch(callback)
+        batches.append(batch)
+        return batch
+
     service.users().messages().list.side_effect = message_list
     service.users().messages().get.side_effect = message_get
-    if batch_factory is None:
-        batch_factory = lambda callback: _FakeBatch(callback)
-    service.new_batch_http_request.side_effect = batch_factory
+    service.new_batch_http_request.side_effect = batch_factory or recording_batch_factory
+    # Batches created during the call, in order, for batch-boundary assertions.
+    service.created_batches = batches
     return service
+
+
+def _get_call_kwargs(service):
+    """All kwargs passed to messages().get(), in call order."""
+    return [
+        call.kwargs
+        for call in service.users.return_value.messages.return_value.get.call_args_list
+    ]
 
 
 def _list_response(message_ids, next_page_token=None):
@@ -168,11 +190,60 @@ async def test_include_headers_returns_subject_sender_and_date():
     assert "Message ID: msg-1" in result
     assert "Thread ID: thread-msg-1" in result
 
-    formats = [
-        call.kwargs["format"]
-        for call in service.users.return_value.messages.return_value.get.call_args_list
+    get_calls = _get_call_kwargs(service)
+    assert [call["format"] for call in get_calls] == ["metadata", "metadata"]
+    # Every fetch must request the metadata header allowlist, which is what
+    # actually makes Subject/From/Date available on the response.
+    for call in get_calls:
+        assert call["metadataHeaders"] == GMAIL_METADATA_HEADERS
+        for required in ("Subject", "From", "Date"):
+            assert required in call["metadataHeaders"]
+
+
+def test_batch_size_stays_under_measured_429_threshold():
+    """Pin the chunk size itself, not just the splitting logic.
+
+    Measured live against a real account: chunks of 25 (the general
+    GMAIL_BATCH_SIZE) returned 429 "Too many concurrent requests for user"
+    for 9 of 50 metadata gets, because the batch endpoint runs every get in
+    a chunk concurrently server-side. Chunks of 10 returned 50/50 clean.
+    Raising this constant back toward 25 reintroduces that failure, so it is
+    asserted here rather than left to a comment.
+    """
+    assert 1 <= GMAIL_SEARCH_HEADER_BATCH_SIZE <= 10
+
+
+@pytest.mark.asyncio
+async def test_header_fetches_are_chunked_at_batch_size(monkeypatch):
+    """Chunking is what keeps us under Gmail's per-user concurrency limit.
+
+    Batches larger than GMAIL_SEARCH_HEADER_BATCH_SIZE reproducibly return
+    429 "Too many concurrent requests for user", so the split must hold.
+    """
+    import gmail.gmail_tools as gmail_tools
+
+    monkeypatch.setattr(gmail_tools, "GMAIL_REQUEST_DELAY", 0)
+
+    message_ids = [f"msg-{i}" for i in range(GMAIL_SEARCH_HEADER_BATCH_SIZE + 1)]
+    service = _build_service(
+        list_response=_list_response(message_ids),
+        message_responses={
+            (mid, "metadata"): _metadata_response(mid) for mid in message_ids
+        },
+    )
+
+    result = await _run_search(service, include_headers=True)
+
+    batch_sizes = [len(batch.request_ids) for batch in service.created_batches]
+    assert batch_sizes == [GMAIL_SEARCH_HEADER_BATCH_SIZE, 1]
+    # Chunk boundaries must not drop or duplicate any ID.
+    batched_ids = [
+        mid for batch in service.created_batches for mid in batch.request_ids
     ]
-    assert formats == ["metadata", "metadata"]
+    assert batched_ids == message_ids
+    assert len(_get_call_kwargs(service)) == len(message_ids)
+    assert "Headers: unavailable" not in result
+    assert result.count("Subject: Example subject") == len(message_ids)
 
 
 @pytest.mark.asyncio
