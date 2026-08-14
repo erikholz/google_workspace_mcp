@@ -7,6 +7,7 @@ This module provides MCP tools for interacting with the Gmail API.
 import logging
 import asyncio
 import base64
+import json
 import binascii
 import re
 import mimetypes
@@ -3467,15 +3468,29 @@ async def get_gmail_threads_content_batch(
 )
 @handle_http_errors("list_gmail_labels", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
-async def list_gmail_labels(service, user_google_email: str) -> str:
+async def list_gmail_labels(
+    service,
+    user_google_email: str,
+    prefix: Optional[str] = None,
+    compact: bool = False,
+    include_system: bool = True,
+) -> str:
     """
-    Lists all labels in the user's Gmail account.
+    Lists labels in the user's Gmail account.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
+        prefix (Optional[str]): Return only labels whose name starts with this
+            exact (case-sensitive) string. With a hierarchical label tree this
+            fetches one subtree instead of the whole list.
+        compact (bool): Return minimal JSON {"count", "labels": [{"id", "name"}]}
+            sorted by name, instead of the formatted text list. For callers
+            that parse the result, e.g. a label cache refresh.
+        include_system (bool): Include Gmail system labels (INBOX, SENT, ...).
+            Set False to return user labels only.
 
     Returns:
-        str: A formatted list of all labels with their IDs, names, and types.
+        str: A formatted list of labels, or minimal JSON when compact=True.
     """
     logger.info(f"[list_gmail_labels] Invoked. Email: '{user_google_email}'")
 
@@ -3484,8 +3499,29 @@ async def list_gmail_labels(service, user_google_email: str) -> str:
     )
     labels = response.get("labels", [])
 
+    if not include_system:
+        labels = [lab for lab in labels if lab.get("type") != "system"]
+    if prefix is not None:
+        labels = [lab for lab in labels if lab.get("name", "").startswith(prefix)]
+
+    if compact:
+        return json.dumps(
+            {
+                "count": len(labels),
+                "labels": sorted(
+                    ({"id": lab["id"], "name": lab["name"]} for lab in labels),
+                    key=lambda lab: lab["name"],
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     if not labels:
-        return "No labels found."
+        return (
+            "No labels found."
+            if prefix is None
+            else f"No labels found with prefix {prefix!r}."
+        )
 
     lines = [f"Found {len(labels)} labels:", ""]
 
