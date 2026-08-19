@@ -766,3 +766,68 @@ def _strip_quoted_plaintext(text: str) -> tuple[str, int, Optional[str]]:
     if removed <= 0:
         return text, 0, None
     return kept, removed, marker
+
+
+# ---------------------------------------------------------------------------
+# History (incremental sync) aggregation
+#
+# users.history.list returns one record per change, and the same message can
+# appear across several records. Callers want the deduplicated answer to "what
+# changed", so aggregation happens here rather than in every consumer.
+# ---------------------------------------------------------------------------
+
+GMAIL_HISTORY_TYPES = ("messageAdded", "messageDeleted", "labelAdded", "labelRemoved")
+
+# Maps a history record's bucket key to the output key, and whether entries in
+# that bucket carry labelIds alongside the message.
+_HISTORY_BUCKETS = (
+    ("messagesAdded", "messages_added", False),
+    ("messagesDeleted", "messages_deleted", False),
+    ("labelsAdded", "labels_added", True),
+    ("labelsRemoved", "labels_removed", True),
+)
+
+
+def _collect_history_changes(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Aggregate raw history records into deduplicated per-type change lists.
+
+    Returns {"messages_added", "messages_deleted", "labels_added",
+    "labels_removed", "thread_ids", "counts"}. Message entries are
+    {"id", "thread_id"}, plus "label_ids" on the label buckets. Order is first
+    appearance, so the oldest change to a message wins its position.
+    """
+    buckets: dict[str, dict[str, dict[str, Any]]] = {
+        out_key: {} for _, out_key, _ in _HISTORY_BUCKETS
+    }
+    thread_ids: dict[str, None] = {}
+
+    for record in records or []:
+        for api_key, out_key, carries_labels in _HISTORY_BUCKETS:
+            for entry in record.get(api_key, []) or []:
+                message = entry.get("message") or {}
+                message_id = message.get("id")
+                if not message_id:
+                    continue
+                thread_id = message.get("threadId")
+                existing = buckets[out_key].get(message_id)
+                if existing is None:
+                    existing = {"id": message_id, "thread_id": thread_id}
+                    if carries_labels:
+                        existing["label_ids"] = []
+                    buckets[out_key][message_id] = existing
+                if carries_labels:
+                    for label_id in entry.get("labelIds", []) or []:
+                        if label_id not in existing["label_ids"]:
+                            existing["label_ids"].append(label_id)
+                if thread_id:
+                    thread_ids.setdefault(thread_id, None)
+
+    result: dict[str, Any] = {
+        out_key: list(buckets[out_key].values()) for _, out_key, _ in _HISTORY_BUCKETS
+    }
+    result["thread_ids"] = list(thread_ids)
+    result["counts"] = {
+        out_key: len(buckets[out_key]) for _, out_key, _ in _HISTORY_BUCKETS
+    }
+    result["counts"]["threads"] = len(thread_ids)
+    return result

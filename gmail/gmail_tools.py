@@ -58,6 +58,7 @@ from auth.scopes import (
     GMAIL_LABELS_SCOPE,
 )
 from gmail.gmail_helpers import (
+    GMAIL_HISTORY_TYPES,
     GMAIL_METADATA_HEADERS,
     QUOTE_HTML_CLASS_MARKERS,
     QUOTE_HTML_IDS,
@@ -66,9 +67,11 @@ from gmail.gmail_helpers import (
     VOID_HTML_TAGS,
     _analyze_thread_ownership_impl,
     _build_forward_content,
+    _collect_history_changes,
     _derive_reply_all_recipients,
     _derive_reply_headers,
     _fetch_with_retry,
+    _http_error_status,
     _is_benign_signature_http_error,
     _retryable_result_ids,
     _signature_fetch_tool_error,
@@ -90,6 +93,11 @@ HTML_BODY_TRUNCATE_LIMIT = 20000
 # keep their existing behavior: the text path is uncapped there, and the
 # HTML path keeps HTML_BODY_TRUNCATE_LIMIT.
 DIGEST_BODY_TRUNCATE_LIMIT = 4000
+# users.history.list caps maxResults at 500. The page budget is a guard
+# against an unbounded walk, not a silent truncation: exceeding it is
+# reported and the checkpoint is withheld.
+GMAIL_HISTORY_PAGE_SIZE = 500
+GMAIL_HISTORY_MAX_PAGES = 20
 LOW_VALUE_TEXT_PLACEHOLDERS = (
     "your client does not support html",
     "view this email in your browser",
@@ -3822,6 +3830,212 @@ async def get_gmail_threads_content_batch(
     # Combine all threads with separators
     header = f"Retrieved {len(thread_ids)} threads:"
     return header + "\n\n" + "\n---\n\n".join(output_threads)
+
+
+async def _current_mailbox_history_id(service) -> Optional[str]:
+    """Current mailbox historyId from users.getProfile, the bootstrap checkpoint."""
+    profile = await asyncio.to_thread(service.users().getProfile(userId="me").execute)
+    return profile.get("historyId")
+
+
+@server.tool(
+    title="Get Gmail History",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("gmail", "gmail_read")
+@handle_http_errors("get_gmail_history", is_read_only=True, service_type="gmail")
+async def get_gmail_history(
+    service,
+    user_google_email: str,
+    start_history_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Checkpoint to list changes since, taken from a previous call's "
+                "history_id. Omit to run in bootstrap mode, which returns the "
+                "current mailbox history_id and no changes."
+            ),
+        ),
+    ] = None,
+    label_id: Annotated[
+        Optional[str],
+        Field(description="Only report changes affecting this label ID."),
+    ] = None,
+    history_types: Annotated[
+        Optional[List[str]],
+        Field(
+            description=(
+                "Restrict to these change types. Any of messageAdded, "
+                "messageDeleted, labelAdded, labelRemoved. Omit for all."
+            ),
+        ),
+    ] = None,
+    max_pages: Annotated[
+        int,
+        Field(
+            description=(
+                "Page budget for the walk. Exceeding it is reported as "
+                "complete=false with no checkpoint, never as a short result."
+            ),
+        ),
+    ] = GMAIL_HISTORY_MAX_PAGES,
+) -> Dict[str, Any]:
+    """
+    Lists what changed in the mailbox since a checkpoint, using the Gmail
+    history endpoint instead of re-running a dated search with an overlap
+    window.
+
+    Three modes, distinguished by the "mode" key so that an empty result can
+    never be mistaken for a failure:
+
+    - "bootstrap" (no start_history_id): returns the current mailbox
+      history_id to store as a checkpoint. No changes are returned.
+    - "delta": returns deduplicated changes since start_history_id, plus a new
+      history_id to store for next time.
+    - "expired": the checkpoint predates Gmail's history retention, so partial
+      sync is not possible. Google documents a historyId as typically valid
+      for at least a week, and in rare cases only a few hours. A fresh
+      history_id is returned alongside expired=true so the caller can perform
+      a full sync and re-checkpoint.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        start_history_id (Optional[str]): Checkpoint from a previous call.
+        label_id (Optional[str]): Only report changes affecting this label.
+        history_types (Optional[List[str]]): Restrict to these change types.
+        max_pages (int): Page budget for the walk.
+
+    Returns:
+        Dict[str, Any]: See the modes above. In "delta" mode: "complete",
+        "history_id", "start_history_id", "pages", "records", "counts",
+        "thread_ids" and "changes" (messages_added, messages_deleted,
+        labels_added, labels_removed). When "complete" is false the walk hit
+        its page budget, "history_id" is None, and the caller must NOT advance
+        its stored checkpoint.
+    """
+    logger.info(
+        f"[get_gmail_history] Invoked. Email: '{user_google_email}', "
+        f"start_history_id={start_history_id}, label_id={label_id}, "
+        f"history_types={history_types}"
+    )
+
+    if history_types:
+        unknown = [item for item in history_types if item not in GMAIL_HISTORY_TYPES]
+        if unknown:
+            raise UserInputError(
+                f"Unknown history_types {unknown}. "
+                f"Valid values: {list(GMAIL_HISTORY_TYPES)}."
+            )
+
+    if not start_history_id:
+        history_id = await _current_mailbox_history_id(service)
+        logger.info(f"[get_gmail_history] Bootstrap checkpoint: {history_id}")
+        return {
+            "mode": "bootstrap",
+            "history_id": history_id,
+            "changes": None,
+            "note": (
+                "Checkpoint only. Store this history_id and pass it back as "
+                "start_history_id to receive changes since now."
+            ),
+        }
+
+    records: List[Dict[str, Any]] = []
+    page_token = None
+    pages = 0
+    latest_history_id = None
+    hit_page_budget = False
+
+    while True:
+        request_kwargs: Dict[str, Any] = {
+            "userId": "me",
+            "startHistoryId": str(start_history_id),
+            "maxResults": GMAIL_HISTORY_PAGE_SIZE,
+        }
+        if label_id:
+            request_kwargs["labelId"] = label_id
+        if history_types:
+            request_kwargs["historyTypes"] = list(history_types)
+        if page_token:
+            request_kwargs["pageToken"] = page_token
+
+        try:
+            response = await asyncio.to_thread(
+                service.users().history().list(**request_kwargs).execute
+            )
+        except HttpError as error:
+            if _http_error_status(error) != 404:
+                raise
+            # Google returns 404 when startHistoryId predates the retained
+            # history window. That is an expected outcome rather than a tool
+            # failure, but it must never look like "nothing changed".
+            logger.warning(
+                f"[get_gmail_history] startHistoryId {start_history_id} is outside "
+                "the retained history window; caller must perform a full sync."
+            )
+            return {
+                "mode": "expired",
+                "expired": True,
+                "start_history_id": str(start_history_id),
+                "history_id": await _current_mailbox_history_id(service),
+                "changes": None,
+                "guidance": (
+                    "The checkpoint is older than Gmail's history retention. "
+                    "Partial sync is not possible: perform a full sync and "
+                    "store the returned history_id as the new checkpoint."
+                ),
+            }
+
+        pages += 1
+        records.extend(response.get("history", []) or [])
+        latest_history_id = response.get("historyId") or latest_history_id
+        page_token = response.get("nextPageToken")
+
+        if not page_token:
+            break
+        if pages >= max_pages:
+            hit_page_budget = True
+            break
+
+    changes = _collect_history_changes(records)
+    complete = not hit_page_budget
+
+    result: Dict[str, Any] = {
+        "mode": "delta",
+        "expired": False,
+        "complete": complete,
+        "start_history_id": str(start_history_id),
+        "history_id": latest_history_id if complete else None,
+        "pages": pages,
+        "records": len(records),
+        "counts": changes["counts"],
+        "thread_ids": changes["thread_ids"],
+        "changes": {
+            "messages_added": changes["messages_added"],
+            "messages_deleted": changes["messages_deleted"],
+            "labels_added": changes["labels_added"],
+            "labels_removed": changes["labels_removed"],
+        },
+    }
+
+    if not complete:
+        result["warning"] = (
+            f"Walk stopped at the {max_pages}-page budget with more pages "
+            "available. The listed changes are partial and history_id is null: "
+            "do NOT advance the stored checkpoint. Re-run with a higher "
+            "max_pages, or perform a full sync."
+        )
+        logger.warning(
+            f"[get_gmail_history] Page budget {max_pages} reached with more "
+            "pages available; returning complete=false and no checkpoint."
+        )
+
+    return result
 
 
 @server.tool(
